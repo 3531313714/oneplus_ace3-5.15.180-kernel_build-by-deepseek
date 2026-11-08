@@ -42,8 +42,6 @@ env:
   SUKISU_REPO: https://github.com/SukiSU-Ultra/SukiSU-Ultra
   SUKISU_TAG: v4.3.0
   KERNELPATCH_RELEASE: 0.13.9
-  # 与源码 build.config.constants 中 CLANG_VERSION 一致，务必保持
-  CLANG_VERSION: r450784e
   ARCH: arm64
   # kalama 的 GKI 合并 defconfig（gki_defconfig + vendor/kalama_GKI.config）
   DEFCONFIG: vendor/kalama-gki_defconfig
@@ -75,40 +73,25 @@ jobs:
           which pahole && pahole --version || echo "pahole missing (BTF 可能无法生成)"
 
       # -----------------------------------------------------------------------
-      # 2. 下载 AOSP Clang 工具链（与内核 pin 的 CLANG_VERSION 一致）
-      #    LLVM=1 需要 clang/ld.lld/llvm-ar/llvm-objcopy/... 均在 bin/ 下。
+      # 2. 安装 LLVM/Clang 工具链（LLVM=1 编译 arm64 内核用）
+      #    改用 Ubuntu 22.04 自带的 clang-14（与内核 pin 的 r450784e≈clang 14.0.7 同级），
+      #    避免 googlesource 老版本 clang 被清理导致 +archive 返回 400。
+      #    为 LLVM=1 创建无版本号的软链（clang/ld.lld/llvm-ar/...）。
       # -----------------------------------------------------------------------
-      - name: Cache Clang toolchain
-        id: cache-clang
-        uses: actions/cache@v4
-        with:
-          path: toolchain/clang
-          key: aosp-clang-${{ env.CLANG_VERSION }}
-
-      - name: Download AOSP Clang ${{ env.CLANG_VERSION }}
-        if: steps.cache-clang.outputs.cache-hit != 'true'
+      - name: Install LLVM/Clang toolchain
         run: |
           set -euo pipefail
-          mkdir -p toolchain/clang
-          # curl --retry-all-errors 对 5xx/连接失败都会重试；master 不命中则回退到 tag
-          URLS=(
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-${CLANG_VERSION}.tar.gz"
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-13.0.0_r69/clang-${CLANG_VERSION}.tar.gz"
-          )
-          for URL in "${URLS[@]}"; do
-            echo "Downloading $URL"
-            if curl -fL --retry 5 --retry-delay 3 --retry-all-errors "$URL" -o clang.tar.gz; then
-              echo "downloaded OK"; break
+          sudo apt-get install -y clang-14 lld-14 llvm-14
+          for tool in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump \
+                      llvm-readelf llvm-strip llvm-as llvm-addr2line llvm-ranlib llvm-size; do
+            if [ -x "/usr/bin/${tool}-14" ]; then
+              sudo ln -sf "/usr/bin/${tool}-14" "/usr/local/bin/${tool}"
             fi
-            echo "download failed, trying next source ..."
-            rm -f clang.tar.gz
           done
-          [ -f clang.tar.gz ] || { echo "clang download failed"; exit 1; }
-          tar xzf clang.tar.gz -C toolchain/clang
-          rm -f clang.tar.gz
-          echo "--- clang version ---"
-          toolchain/clang/bin/clang --version
-          ls toolchain/clang/bin | grep -E '^(clang|ld.lld|llvm-ar|llvm-objcopy|llvm-strip)$' || true
+          echo "--- toolchain ---"
+          clang --version
+          ld.lld --version
+          command -v clang ld.lld llvm-ar llvm-objcopy llvm-strip
 
       # -----------------------------------------------------------------------
       # 3. 拉取 OnePlus 官方内核源码（分支 sm8550_u_14.0.0_ace3）
@@ -218,7 +201,6 @@ jobs:
         run: |
           set -euo pipefail
           cd kernel
-          export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$PATH"
           export ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-
 
           # 5.1 生成合并 defconfig（等价官方 build.config 的 build_defconfig_fragments）
@@ -303,7 +285,6 @@ jobs:
         run: |
           set -euo pipefail
           cd kernel
-          export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$PATH"
           export ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-
           make O=out -j"$(nproc)" Image 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
           echo "--- 产物 ---"
