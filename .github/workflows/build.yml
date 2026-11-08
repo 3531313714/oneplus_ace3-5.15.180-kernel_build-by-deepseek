@@ -292,6 +292,14 @@ jobs:
             scripts/config --file out/.config --set-str CONFIG_LOCALVERSION "${LOCALVERSION}"
           fi
 
+          # 5.4b 关闭 LTO：大幅降低链接内存/时间，避免 7GB runner 上 LTO 链接 OOM（SIGTERM 143）
+          #       对性能/隐藏/资源占用/稳定性影响可忽略；也不影响 vendor_dlkm 模块加载
+          #       （modversions CRC 与 EXPORT_SYMBOL 均与 LTO 无关）
+          scripts/config --file out/.config -e CONFIG_LTO_NONE
+          scripts/config --file out/.config -d CONFIG_LTO_CLANG_THIN
+          scripts/config --file out/.config -d CONFIG_LTO_CLANG_FULL
+          scripts/config --file out/.config -d CONFIG_LTO_CLANG
+
           # 5.5 解析依赖
           make O=out olddefconfig
 
@@ -319,6 +327,9 @@ jobs:
           set -euo pipefail
           cd kernel
           export ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-
+          # 7GB 内存的免费 runner 上，GKI 的 LTO 链接(vmlinux.o)很容易 OOM 被 SIGTERM（退出码 143）。
+          # 限制 ThinLTO 并行后端任务数为 1，显著降低链接峰值内存（代价是链接变慢，仍在超时内）。
+          export LLVM_PARALLEL_JOBS=1
           make O=out -j"$(nproc)" Image 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
           echo "--- 产物 ---"
           ls -l out/arch/arm64/boot/Image
