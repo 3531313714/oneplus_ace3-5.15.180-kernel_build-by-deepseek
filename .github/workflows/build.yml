@@ -114,6 +114,22 @@ jobs:
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' Makefile
 
       # -----------------------------------------------------------------------
+      # 修复 OnePlus 官方源码“阉割”后残留的 Kconfig 悬空引用
+      #   OnePlus 会删除部分 vendor 目录（如 kernel/oplus_cpu/thermal/），但
+      #   init/Kconfig 等仍保留 source "..." 行，导致 make defconfig 报
+      #   "can't open file ..."。这里把所有指向不存在文件的 source 行注释掉。
+      #   （若后续 make Image 还报 "No rule to make target ..."，是同类问题，
+      #    出现在 Makefile 的 obj-y/obj-m 里，需按同样方式处理）
+      # -----------------------------------------------------------------------
+      - name: Fix dangling Kconfig references
+        run: |
+          set -euo pipefail
+          cd kernel
+          find . -path ./.git -prune -o -name 'Kconfig*' -type f -print0 \
+            | xargs -0 -r perl -i -pe 'if (/^(\s*)source\s+"([^"]+)"/ && $2 !~ /\$/ && ! -e $2) { print STDERR "[fix] disabled source: $2\n"; $_ = "$1# source \"$2\"  # auto-disabled: missing\n"; }'
+          echo "--- Kconfig 悬空引用已处理 ---"
+
+      # -----------------------------------------------------------------------
       # 4. 强制写死内核版本号 5.15.<sublevel>（默认 180）
       # -----------------------------------------------------------------------
       - name: Force kernel version 5.15.${{ inputs.kernel_sublevel }}
