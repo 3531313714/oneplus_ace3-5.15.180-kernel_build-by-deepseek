@@ -353,6 +353,9 @@ jobs:
             sleep 10
             [ "$i" = 5 ] && exit 1
           done
+          # 关键：kptools 的 patch.h 依赖 preset.h，它由 kernel/Makefile 的 hdr 目标
+          #       把 kernel/include/preset.h 复制到 tools/preset.h，必须先跑
+          make -C kp-src/kernel hdr
           make -C kp-src/tools
           cp kp-src/tools/kptools ./kptools
           chmod +x kptools
