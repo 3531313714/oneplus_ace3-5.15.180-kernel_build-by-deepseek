@@ -32,7 +32,7 @@ on:
         required: false
         default: ''
       superkey:
-        description: '可选：KernelPatch superkey（留空则使用 root-skey 方案'
+        description: '可选：KernelPatch superkey（留空则使用 root-skey 方案）'
         required: false
         default: ''
 
@@ -71,8 +71,7 @@ jobs:
             git curl wget zip unzip xz-utils cpio rsync file \
             build-essential libssl-dev libelf-dev libncurses-dev \
             flex bison bc python3 kmod dwarves ca-certificates
-          echo "--- tool versions ---"
-          git --version; curl --version | head -1; make --version | head -1
+          echo "Dependencies installed successfully!"
           which pahole && pahole --version || echo "pahole missing (BTF 可能无法生成)"
 
       # -----------------------------------------------------------------------
