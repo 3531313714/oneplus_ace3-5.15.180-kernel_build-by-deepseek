@@ -130,6 +130,23 @@ jobs:
           echo "--- Kconfig 悬空引用已处理 ---"
 
       # -----------------------------------------------------------------------
+      # 修复 Makefile 里同样因源码裁剪残留的 obj-* += 目录引用
+      #   （例：drivers/soc/Makefile 里 obj-y += oplus/sensor/，但该目录里的
+      #     Makefile 被删了，编译时报 "No rule to make target '.../Makefile'"。
+      #     注意判断条件必须是「目标目录下没有 Makefile 也没有 Kbuild」，
+      #     而不是「目录不存在」——OnePlus 往往只删 Makefile/源码，目录可能还在）
+      # -----------------------------------------------------------------------
+      - name: Fix dangling Makefile references
+        run: |
+          set -euo pipefail
+          cd kernel
+          while IFS= read -r -d '' mf; do
+            d=$(dirname "$mf")
+            MAKEDIR="$d" perl -i -pe 'if (/^(\s*)((?:obj-[ym]|obj-\$\([^)]*\))\s*\+=\s*)([^\s\\#]+)\/\s*$/) { my $d = $ENV{MAKEDIR}; my $t = $3; if (! -e "$d/$t/Makefile" && ! -e "$d/$t/Kbuild") { print STDERR "[fix] disabled: $d/$t/\n"; $_ = "$1# $2$t/  # auto-disabled: missing Makefile\n"; } }' "$mf"
+          done < <(find . -path ./.git -prune -o -name 'Makefile' -type f -print0 -o -name 'Kbuild*' -type f -print0)
+          echo "--- Makefile 悬空引用已处理 ---"
+
+      # -----------------------------------------------------------------------
       # 4. 强制写死内核版本号 5.15.<sublevel>（默认 180）
       # -----------------------------------------------------------------------
       - name: Force kernel version 5.15.${{ inputs.kernel_sublevel }}
