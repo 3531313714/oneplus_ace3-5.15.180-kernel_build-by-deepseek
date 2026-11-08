@@ -337,14 +337,24 @@ jobs:
           grep -aE 'SukiSU-Ultra version|KPM is enabled|KPM is disabled|KERNEL_TYPE' "$GITHUB_WORKSPACE/build.log" | head -10 || true
 
       # -----------------------------------------------------------------------
-      # 8. 下载 KernelPatch（kptools + kpimg）并把 kpimg 注入 Image 末尾
+      # 8. 获取 KernelPatch（kpimg 预编译 + kptools 本机编译）并注入 Image 末尾
+      #    官方预编译 kptools-linux 需 glibc 2.38（ubuntu-22.04 仅 2.35）跑不起来，
+      #    故 kptools 改为源码本机编译；kpimg 只是被嵌入的数据、不在 host 执行，直接下载。
       # -----------------------------------------------------------------------
       - name: Embed KernelPatch kpimg into Image
         run: |
           set -euo pipefail
           BASE="https://github.com/bmax121/KernelPatch/releases/download/${KERNELPATCH_RELEASE}"
-          curl -fL --retry 5 --retry-delay 3 --retry-all-errors "$BASE/kptools-linux" -o kptools
           curl -fL --retry 5 --retry-delay 3 --retry-all-errors "$BASE/kpimg-android" -o kpimg
+          sudo apt-get install -y zlib1g-dev
+          for i in 1 2 3 4 5; do
+            git clone --depth=1 --branch "${KERNELPATCH_RELEASE}" https://github.com/bmax121/KernelPatch.git kp-src && break
+            echo "KernelPatch clone failed, attempt $i/5, retrying ..."
+            sleep 10
+            [ "$i" = 5 ] && exit 1
+          done
+          make -C kp-src/tools
+          cp kp-src/tools/kptools ./kptools
           chmod +x kptools
           echo "--- kptools 版本 ---"
           ./kptools -v
