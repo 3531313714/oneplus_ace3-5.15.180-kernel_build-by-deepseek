@@ -1,0 +1,398 @@
+name: OnePlus Ace 3 GKI Kernel (5.15.180 + SukiSU Ultra + KPM)
+
+# =============================================================================
+# 一加 Ace 3（SM8550 / kalama，ColorOS 16，内核基线 5.15-android13）
+# 从官方源码编译 GKI built-in 内核（KSU + KPM 全部编译进 Image），
+# 注入 KernelPatch 运行时（kpimg），并用 AnyKernel3 打包为 boot 分区刷机包。
+#
+# 关键结论（均已核实，勿改）：
+#   - 官方源码分支：oneplus/sm8550_u_14.0.0_ace3
+#     该源码 Makefile 原始版本是 5.15.123，本工作流按要求强制为 5.15.180。
+#   - SukiSU Ultra 稳定标签：v4.3.0（仓库 SukiSU-Ultra/SukiSU-Ultra）。
+#     CONFIG 符号是 CONFIG_KSU（根）与 CONFIG_KPM（KPM），不是 CONFIG_SUKISU。
+#     setup.sh 在 kernel/setup.sh，会把 kernel/ 软链到 drivers/kernelsu 并
+#     修改 drivers/Makefile 与 drivers/Kconfig。
+#     UAPI/版本号宏是 KSU_VERSION（ksu.h 里 KERNEL_SU_VERSION=KSU_VERSION），
+#     由 kernel/Kbuild 动态计算，且会实时请求 GitHub 主分支提交数 —— 这是
+#     “内核需要更新 / UAPI 漂移” 的根源，本工作流在编译前将其强制锁定为
+#     v4.3.0 标签对应的确定值。
+#   - KernelPatch：release 0.13.9，资产为 kptools-linux 与 kpimg-android。
+#     嵌入命令：kptools -p -i <Image> -k <kpimg> -o <out> [-s <skey>]
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_sublevel:
+        description: '内核 SUBLEVEL（Makefile 中强制写死的子版本号）'
+        required: false
+        default: '180'
+      localversion:
+        description: '可选：CONFIG_LOCALVERSION，用于精确匹配设备 uname -r / vermagic（留空则用 git 生成）'
+        required: false
+        default: ''
+      superkey:
+        description: '可选：KernelPatch superkey（留空则使用 root-skey 方案；如需保密可把第 341 行的 env 改为 ${{ secrets.SUPERKEY }}）'
+        required: false
+        default: ''
+
+env:
+  KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8550.git
+  KERNEL_BRANCH: oneplus/sm8550_u_14.0.0_ace3
+  SUKISU_REPO: https://github.com/SukiSU-Ultra/SukiSU-Ultra
+  SUKISU_TAG: v4.3.0
+  KERNELPATCH_RELEASE: 0.13.9
+  # 与源码 build.config.constants 中 CLANG_VERSION 一致，务必保持
+  CLANG_VERSION: r450784e
+  ARCH: arm64
+  # kalama 的 GKI 合并 defconfig（gki_defconfig + vendor/kalama_GKI.config）
+  DEFCONFIG: vendor/kalama-gki_defconfig
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 0. 检出本仓库（保证 $GITHUB_WORKSPACE 就绪；内核源码在后续步骤单独克隆）
+      # -----------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 1. 安装编译依赖
+      # -----------------------------------------------------------------------
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            git curl wget zip unzip xz-utils cpio rsync file \
+            build-essential libssl-dev libelf-dev libncurses-dev \
+            flex bison bc python3 kmod dwarves ca-certificates
+          echo "--- tool versions ---"
+          git --version; curl --version | head -1; make --version | head -1
+          which pahole && pahole --version || echo "pahole missing (BTF 可能无法生成)"
+
+      # -----------------------------------------------------------------------
+      # 2. 下载 AOSP Clang 工具链（与内核 pin 的 CLANG_VERSION 一致）
+      #    LLVM=1 需要 clang/ld.lld/llvm-ar/llvm-objcopy/... 均在 bin/ 下。
+      # -----------------------------------------------------------------------
+      - name: Cache Clang toolchain
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: toolchain/clang
+          key: aosp-clang-${{ env.CLANG_VERSION }}
+
+      - name: Download AOSP Clang ${{ env.CLANG_VERSION }}
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p toolchain/clang
+          # curl --retry-all-errors 对 5xx/连接失败都会重试；master 不命中则回退到 tag
+          URLS=(
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-${CLANG_VERSION}.tar.gz"
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-13.0.0_r69/clang-${CLANG_VERSION}.tar.gz"
+          )
+          for URL in "${URLS[@]}"; do
+            echo "Downloading $URL"
+            if curl -fL --retry 5 --retry-delay 3 --retry-all-errors "$URL" -o clang.tar.gz; then
+              echo "downloaded OK"; break
+            fi
+            echo "download failed, trying next source ..."
+            rm -f clang.tar.gz
+          done
+          [ -f clang.tar.gz ] || { echo "clang download failed"; exit 1; }
+          tar xzf clang.tar.gz -C toolchain/clang
+          rm -f clang.tar.gz
+          echo "--- clang version ---"
+          toolchain/clang/bin/clang --version
+          ls toolchain/clang/bin | grep -E '^(clang|ld.lld|llvm-ar|llvm-objcopy|llvm-strip)$' || true
+
+      # -----------------------------------------------------------------------
+      # 3. 拉取 OnePlus 官方内核源码（分支 sm8550_u_14.0.0_ace3）
+      #    单仓库、无 repo manifest；仍执行 submodule 初始化以应对未来变更。
+      # -----------------------------------------------------------------------
+      - name: Clone OnePlus kernel source
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            git clone --depth=1 --branch "${KERNEL_BRANCH}" "${KERNEL_REPO}" kernel && break
+            echo "clone failed, attempt $i/5, retrying in 15s ..."
+            sleep 15
+            [ "$i" = 5 ] && exit 1
+          done
+          cd kernel
+          git submodule update --init --recursive || echo "no submodules (expected for this branch)"
+          echo "--- HEAD ---"
+          git log -1 --oneline
+          echo "--- 原始版本头 ---"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' Makefile
+
+      # -----------------------------------------------------------------------
+      # 4. 强制写死内核版本号 5.15.<sublevel>（默认 180）
+      # -----------------------------------------------------------------------
+      - name: Force kernel version 5.15.${{ inputs.kernel_sublevel }}
+        run: |
+          set -euo pipefail
+          SUBLEVEL="${INPUT_SUBLEVEL:-180}"
+          cd kernel
+          sed -i -E 's/^VERSION[[:space:]]*=.*/VERSION = 5/' Makefile
+          sed -i -E 's/^PATCHLEVEL[[:space:]]*=.*/PATCHLEVEL = 15/' Makefile
+          sed -i -E "s/^SUBLEVEL[[:space:]]*=.*/SUBLEVEL = ${SUBLEVEL}/" Makefile
+          echo "--- 强制后的版本头 ---"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' Makefile
+        env:
+          INPUT_SUBLEVEL: ${{ inputs.kernel_sublevel }}
+
+      # -----------------------------------------------------------------------
+      # 5. 集成 SukiSU Ultra（严格 checkout v4.3.0），并强制锁定 UAPI 版本号
+      #
+      #    复刻官方 kernel/setup.sh 的动作（clone -> checkout tag -> 软链
+      #    drivers/kernelsu -> KernelSU/kernel -> 改 drivers/Makefile 与
+      #    drivers/Kconfig），但做两点加固：
+      #      a) 直接 clone 完整历史并 checkout 到 v4.3.0，绝不落到 main 最新提交；
+      #      b) 编译前把 KSU_VERSION（即 KERNEL_SU_VERSION / UAPI 期望值）锁定为
+      #         v4.3.0 标签对应的确定数值，杜绝实时拉取 main 提交数导致的漂移。
+      # -----------------------------------------------------------------------
+      - name: Integrate SukiSU Ultra ${{ env.SUKISU_TAG }} and pin UAPI version
+        run: |
+          set -euo pipefail
+          cd kernel
+
+          # --- 4.1 clone SukiSU-Ultra（完整历史，保证版本计数正确）并 checkout v4.3.0 ---
+          if [ ! -d KernelSU/.git ]; then
+            for i in 1 2 3 4 5; do
+              git clone "${SUKISU_REPO}" KernelSU && break
+              echo "SukiSU clone failed, attempt $i/5, retrying ..."
+              sleep 15
+              [ "$i" = 5 ] && exit 1
+            done
+          fi
+          cd KernelSU
+          git fetch --tags --force || true
+          git checkout "${SUKISU_TAG}"
+          echo "--- SukiSU HEAD（必须是 ${SUKISU_TAG}）---"
+          git describe --tags --exact-match 2>/dev/null || git log -1 --oneline
+          cd ..
+
+          # --- 4.2 复刻 setup.sh：软链 + Makefile/Kconfig 钩子 ---
+          DRIVER_DIR=drivers
+          [ -d "$DRIVER_DIR" ] || { echo "[ERROR] drivers/ 不存在"; exit 1; }
+          ln -sfn "$(realpath --relative-to="$DRIVER_DIR" "$PWD/KernelSU/kernel")" "$DRIVER_DIR/kernelsu"
+          grep -q 'kernelsu' "$DRIVER_DIR/Makefile" || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$DRIVER_DIR/Makefile"
+          grep -q 'source "drivers/kernelsu/Kconfig"' "$DRIVER_DIR/Kconfig" || \
+            sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' "$DRIVER_DIR/Kconfig"
+          echo "--- drivers/Kconfig 已加入 kernelsu ---"
+          grep -n 'kernelsu' "$DRIVER_DIR/Kconfig"
+
+          # --- 4.3 强制锁定 UAPI/版本号（KSU_VERSION）为 v4.3.0 确定值 ---
+          cd KernelSU
+          # 从 v4.3.0 标签的提交数计算版本，公式与 kernel/Kbuild 完全一致
+          COUNT=$(git rev-list --count HEAD)
+          VERSION_BASE=$(sed -n 's/^VERSION_BASE.*\([0-9][0-9]*\).*/\1/p' kernel/Kbuild | head -1)
+          VERSION_OFFSET=$(sed -n 's/^VERSION_OFFSET.*\([0-9][0-9]*\).*/\1/p' kernel/Kbuild | head -1)
+          [ -n "$VERSION_BASE" ]   || VERSION_BASE=40000
+          [ -n "$VERSION_OFFSET" ] || VERSION_OFFSET=2815
+          KSU_VER=$((VERSION_BASE + COUNT - VERSION_OFFSET))
+          echo ">>> 锁定 KSU_VERSION=${KSU_VER} (base=${VERSION_BASE}, offset=${VERSION_OFFSET}, commits@${SUKISU_TAG}=${COUNT})"
+
+          # 消除漂移源：不请求 GitHub 实时提交数 / 不按 main 分支计数 / 固定版本标签
+          sed -i 's|^GITHUB_COMMITS.*|GITHUB_COMMITS :=|' kernel/Kbuild
+          sed -i 's|rev-list --count $(REPO_BRANCH)|rev-list --count HEAD|' kernel/Kbuild
+          sed -i 's|^VERSION_TAG.*|VERSION_TAG := 4.3.0|' kernel/Kbuild
+          # 兜底：直接把 KSU_VERSION 写死（无论上游 Kbuild 结构如何变化都生效）
+          sed -i "s|^KSU_VERSION[[:space:]]*[:=].*|KSU_VERSION := ${KSU_VER}|" kernel/Kbuild
+
+          echo "--- 锁定后的版本相关行 ---"
+          grep -nE 'VERSION_BASE|VERSION_OFFSET|VERSION_TAG|KSU_VERSION|git_commit_count|GITHUB_COMMITS|LOCAL_COUNT' kernel/Kbuild
+          cd ../..
+
+      # -----------------------------------------------------------------------
+      # 6. 配置内核：
+      #    gki_defconfig + vendor/kalama_GKI.config -> vendor/kalama-gki_defconfig
+      #    再注入 KSU/KPM、BBR/CAKE、ZRAM/LZ4、MGLRU(条件)、BBG(条件) 等。
+      # -----------------------------------------------------------------------
+      - name: Configure kernel
+        run: |
+          set -euo pipefail
+          cd kernel
+          export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$PATH"
+          export ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-
+
+          # 5.1 生成合并 defconfig（等价官方 build.config 的 build_defconfig_fragments）
+          KCONFIG_CONFIG=arch/arm64/configs/vendor/kalama-gki_defconfig \
+            scripts/kconfig/merge_config.sh -m -r -y \
+              arch/arm64/configs/gki_defconfig \
+              arch/arm64/configs/vendor/kalama_GKI.config
+          make O=out "${DEFCONFIG}"
+
+          # 5.2 组装自定义 config fragment
+          FRAG="$(mktemp)"
+          {
+            echo "# SukiSU Ultra root + KernelPatch KPM"
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KPM=y"
+            echo "CONFIG_KALLSYMS=y"
+            echo "CONFIG_KALLSYMS_ALL=y"
+            echo ""
+            echo "# BBR / 网络调度（CAKE）"
+            echo "CONFIG_TCP_CONG_ADVANCED=y"
+            echo "CONFIG_TCP_CONG_BBR=y"
+            echo "CONFIG_NET_SCHED=y"
+            echo "CONFIG_NET_SCH_CAKE=y"
+            echo ""
+            echo "# ZRAM + LZ4 压缩"
+            echo "CONFIG_ZRAM=y"
+            echo "CONFIG_ZRAM_DEF_COMP_LZ4=y"
+            echo "CONFIG_LZ4_COMPRESS=y"
+            echo "CONFIG_LZ4_DECOMPRESS=y"
+            echo "CONFIG_CRYPTO_LZ4=y"
+            echo ""
+            echo "# MGLRU（5.15 上若已回移则开启）"
+            if grep -rq '^config LRU_GEN' mm/ ; then
+              echo "CONFIG_LRU_GEN=y"
+              echo "CONFIG_LRU_GEN_ENABLED=y"
+            else
+              echo "# LRU_GEN 不存在，跳过"
+            fi
+            echo ""
+            echo "# BBG 基带防护（非上游标准符号，若存在则开启）"
+            if grep -rq '^config SECURITY_BBG' security/ ; then
+              echo "CONFIG_SECURITY_BBG=y"
+            else
+              echo "# SECURITY_BBG 不存在，跳过"
+            fi
+          } > "$FRAG"
+
+          # 5.3 把自定义 fragment 合并到 out/.config（vendor 片段已在 5.1 的 defconfig 里）
+          KCONFIG_CONFIG=out/.config \
+            scripts/kconfig/merge_config.sh -m -r -y \
+              out/.config \
+              "$FRAG"
+
+          # 5.4 可选：精确匹配 vermagic
+          if [ -n "${LOCALVERSION}" ]; then
+            scripts/config --file out/.config --set-str CONFIG_LOCALVERSION "${LOCALVERSION}"
+          fi
+
+          # 5.5 解析依赖
+          make O=out olddefconfig
+
+          # 5.6 校验关键配置
+          echo "--- 关键配置校验 ---"
+          for c in KSU KPM KALLSYMS KALLSYMS_ALL TCP_CONG_BBR NET_SCH_CAKE ZRAM; do
+            if grep -q "^CONFIG_${c}=y" out/.config; then
+              echo "OK    CONFIG_${c}=y"
+            else
+              echo "FAIL  CONFIG_${c} 未生效 -> $(grep "CONFIG_${c}=" out/.config || echo 'not set')"
+            fi
+          done
+          for c in LRU_GEN LRU_GEN_ENABLED; do
+            grep -q "^CONFIG_${c}=y" out/.config && echo "OK    CONFIG_${c}=y" || echo "INFO  CONFIG_${c} (可选) 未启用"
+          done
+        env:
+          LOCALVERSION: ${{ inputs.localversion }}
+
+      # -----------------------------------------------------------------------
+      # 7. 编译 Image（AnyKernel3 只需替换 boot 分区里的 Image；DTB 在 vendor_boot）
+      #    SukiSU/KPM 版本号会在 make 日志里以 "-- SukiSU-Ultra version: ..." 打印。
+      # -----------------------------------------------------------------------
+      - name: Build kernel Image
+        run: |
+          set -euo pipefail
+          cd kernel
+          export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$PATH"
+          export ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-
+          make O=out -j"$(nproc)" Image 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          echo "--- 产物 ---"
+          ls -l out/arch/arm64/boot/Image
+          echo "--- SukiSU/KPM 编译期版本（来自 build.log）---"
+          grep -aE 'SukiSU-Ultra version|KPM is enabled|KPM is disabled|KERNEL_TYPE' "$GITHUB_WORKSPACE/build.log" | head -10 || true
+
+      # -----------------------------------------------------------------------
+      # 8. 下载 KernelPatch（kptools + kpimg）并把 kpimg 注入 Image 末尾
+      # -----------------------------------------------------------------------
+      - name: Embed KernelPatch kpimg into Image
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/bmax121/KernelPatch/releases/download/${KERNELPATCH_RELEASE}"
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors "$BASE/kptools-linux" -o kptools
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors "$BASE/kpimg-android" -o kpimg
+          chmod +x kptools
+          echo "--- kptools 版本 ---"
+          ./kptools -v
+          echo "--- kpimg 版本 ---"
+          ./kptools -v -k kpimg
+
+          # 嵌入 kpimg（-p 会把 kpimg 追加到 Image 末尾并改写启动入口）
+          set -- -p --image kernel/out/arch/arm64/boot/Image --kpimg kpimg --out Image.kp
+          if [ -n "${SUPERKEY}" ]; then
+            set -- "$@" -s "${SUPERKEY}"
+          fi
+          ./kptools "$@"
+
+          echo "--- 注入结果 ---"
+          ls -l Image.kp
+          ./kptools -l --image Image.kp || true
+        env:
+          SUPERKEY: ${{ inputs.superkey }}
+
+      # -----------------------------------------------------------------------
+      # 9. 用 AnyKernel3 打包为 boot 分区 GKI built-in 刷机包
+      # -----------------------------------------------------------------------
+      - name: Package with AnyKernel3
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel && break
+            echo "AnyKernel3 clone failed, attempt $i/5, retrying ..."
+            sleep 15
+            [ "$i" = 5 ] && exit 1
+          done
+          cd anykernel
+          # 清掉示例内核，放入我们注入 kpimg 后的 Image
+          rm -f Image Image.* zImage zImage-dtb dtb dtbo 2>/dev/null || true
+          cp ../Image.kp Image
+          # 最小化 GKI kernel-only 脚本
+          cat > anykernel.sh <<'EOF'
+# AnyKernel3 for OnePlus Ace 3 (SM8550 / kalama) — GKI built-in
+properties() { '
+kernel.string=OnePlus Ace 3 GKI 5.15.180 (SukiSU Ultra + KPM)
+do.devicecheck=0
+do.modules=0
+do.systemless=0
+do.cleanup=1
+do.cleanuponabort=0
+'; }
+
+# boot 分区（A/B 设备自动加 _a/_b）
+block=/dev/block/bootdevice/by-name/boot;
+is_slot_device=1;
+ramdisk_compression=auto;
+
+. tools/ak3-core.sh;
+
+split_boot;
+flash_boot;
+EOF
+          echo "--- anykernel.sh ---"
+          cat anykernel.sh
+          zip -r9 "../OnePlus_Ace3_GKI_5.15.180_SukiSU_KPM.zip" . -x '*.git*' -x 'README*' -x 'LICENSE*'
+          cd ..
+          echo "--- 打包产物 ---"
+          ls -l OnePlus_Ace3_GKI_5.15.180_SukiSU_KPM.zip
+
+      # -----------------------------------------------------------------------
+      # 10. 上传产物
+      # -----------------------------------------------------------------------
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnePlus-Ace3-GKI-5.15.180-SukiSU-KPM
+          path: |
+            OnePlus_Ace3_GKI_5.15.180_SukiSU_KPM.zip
+            Image.kp
+          if-no-files-found: error
