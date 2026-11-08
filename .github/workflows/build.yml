@@ -32,7 +32,7 @@ on:
         required: false
         default: ''
       superkey:
-        description: '可选：KernelPatch superkey（留空则使用 root-skey 方案；如需保密可把第 341 行的 env 改为 ${{ secrets.SUPERKEY }}）'
+        description: '可选：KernelPatch superkey（留空则使用 root-skey 方案'
         required: false
         default: ''
 
